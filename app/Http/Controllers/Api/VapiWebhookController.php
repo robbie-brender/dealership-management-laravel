@@ -1,0 +1,1194 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+
+class VapiWebhookController extends Controller
+{
+    /**
+     * Handle incoming webhook events from Vapi.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\Response
+     */
+    public function handleWebhook(Request $request)
+    {
+        // Log only essential webhook information to avoid memory issues
+        \Illuminate\Support\Facades\Log::info('Raw Vapi webhook request received', [
+            'method' => $request->method(),
+            'url' => $request->fullUrl(),
+            'headers' => array_intersect_key($request->headers->all(), array_flip(['x-call-id', 'content-type', 'content-length', 'x-vapi-signature'])),
+            'content_length' => $request->header('Content-Length'),
+            'ip' => $request->ip()
+        ]);
+        
+        // For large payloads, respond immediately to avoid timeout
+        if ($request->header('Content-Length') > 1000000) { // 1MB threshold
+            // Send an immediate response
+            $response = response()->json(['status' => 'success', 'message' => 'Webhook received, processing started'], 200);
+            $response->headers->set('Connection', 'close');
+            $response->send();
+            
+            // Close session if active
+            if (session_status() === PHP_SESSION_ACTIVE) {
+                session_write_close();
+            }
+            
+            // Disable output buffering
+            if (ob_get_level()) {
+                ob_end_flush();
+            }
+            flush();
+            
+            // Continue processing in the background
+            ignore_user_abort(true);
+            set_time_limit(300); // 5 minutes
+        }
+        
+        // Get the raw payload
+        $payload = $request->getContent();
+        $signature = $request->header('X-Vapi-Signature');
+        
+        // Get the Vapi service
+        $vapiService = app(\App\Services\VapiService::class);
+        
+        // Verify webhook signature if present
+        if (empty($signature)) {
+            // For local testing, we can bypass signature verification
+            if (!app()->environment('local', 'testing')) {
+                return response()->json(['error' => 'Missing signature header'], 401);
+            }
+            // In local/testing environment, log the missing signature but continue
+            \Illuminate\Support\Facades\Log::info('Webhook signature verification bypassed in local environment');
+        } else if (!$this->verifyWebhookSignature($request)) {
+            \Illuminate\Support\Facades\Log::warning('Invalid webhook signature', [
+                'headers' => $request->headers->all()
+            ]);
+            return response()->json(['status' => 'error', 'message' => 'Invalid webhook signature'], 401);
+        }
+        
+        $payload = $request->all();
+        \Illuminate\Support\Facades\Log::info('Parsed webhook payload', ['payload' => $payload]);
+        
+        // First, try to extract a call ID from any webhook format
+        $callId = $this->extractCallId($payload);
+        
+        // If we have a call ID, check if we need to create an initial record
+        if ($callId) {
+            $existingLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            // If no record exists yet, create one immediately regardless of event type
+            if (!$existingLog) {
+                \Illuminate\Support\Facades\Log::info('Creating initial call record from webhook', ['call_id' => $callId]);
+                
+                // Extract customer phone number (caller_number)
+                $phoneNumber = null;
+                if (isset($payload['customer']) && isset($payload['customer']['number'])) {
+                    $phoneNumber = $payload['customer']['number'];
+                } elseif (isset($payload['message']['customer']) && isset($payload['message']['customer']['number'])) {
+                    $phoneNumber = $payload['message']['customer']['number'];
+                } elseif (isset($payload['call']['customer']) && isset($payload['call']['customer']['number'])) {
+                    $phoneNumber = $payload['call']['customer']['number'];
+                } elseif (isset($payload['from'])) {
+                    $phoneNumber = $payload['from'];
+                } elseif (isset($payload['data']['from'])) {
+                    $phoneNumber = $payload['data']['from'];
+                } elseif (isset($payload['message']['from'])) {
+                    $phoneNumber = $payload['message']['from'];
+                }
+                
+                // Extract recipient phone number (dealership number)
+                $recipientNumber = null;
+                if (isset($payload['phoneNumber']) && isset($payload['phoneNumber']['number'])) {
+                    $recipientNumber = $payload['phoneNumber']['number'];
+                } elseif (isset($payload['message']['phoneNumber']) && isset($payload['message']['phoneNumber']['number'])) {
+                    $recipientNumber = $payload['message']['phoneNumber']['number'];
+                } elseif (isset($payload['call']['phoneNumber']) && isset($payload['call']['phoneNumber']['number'])) {
+                    $recipientNumber = $payload['call']['phoneNumber']['number'];
+                } elseif (isset($payload['to'])) {
+                    $recipientNumber = $payload['to'];
+                } elseif (isset($payload['data']['to'])) {
+                    $recipientNumber = $payload['data']['to'];
+                } elseif (isset($payload['message']['to'])) {
+                    $recipientNumber = $payload['message']['to'];
+                }
+                
+                // Extract assistant ID
+                $assistantId = null;
+                if (isset($payload['assistant']) && isset($payload['assistant']['id'])) {
+                    $assistantId = $payload['assistant']['id'];
+                } elseif (isset($payload['message']['assistant']) && isset($payload['message']['assistant']['id'])) {
+                    $assistantId = $payload['message']['assistant']['id'];
+                } elseif (isset($payload['call']['assistant']) && isset($payload['call']['assistant']['id'])) {
+                    $assistantId = $payload['call']['assistant']['id'];
+                } elseif (isset($payload['assistant_id'])) {
+                    $assistantId = $payload['assistant_id'];
+                } elseif (isset($payload['data']['assistant_id'])) {
+                    $assistantId = $payload['data']['assistant_id'];
+                }
+                
+                // Try to encode metadata safely
+                try {
+                    $encodedMetadata = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+                    
+                    // Check if encoding failed
+                    if ($encodedMetadata === false) {
+                        \Illuminate\Support\Facades\Log::warning('JSON encoding failed for metadata', [
+                            'json_error' => json_last_error_msg()
+                        ]);
+                        // Use a simpler version of the data
+                        $encodedMetadata = json_encode([
+                            'call_id' => $callId,
+                            'timestamp' => date('Y-m-d H:i:s'),
+                            'error' => 'Original metadata could not be encoded'
+                        ]);
+                    }
+                } catch (\Exception $e) {
+                    \Illuminate\Support\Facades\Log::warning('Exception during JSON encoding: ' . $e->getMessage());
+                    $encodedMetadata = json_encode(['error' => 'Failed to encode metadata']);
+                }
+                
+                // Extract basic call data
+                $callData = [
+                    'call_id' => $callId,
+                    'status' => 'initiated',
+                    'direction' => 'inbound', // Default to inbound
+                    'caller_number' => $phoneNumber,
+                    'recipient_number' => $recipientNumber,
+                    'assistant_id' => $assistantId,
+                    'metadata' => $encodedMetadata,
+                    'dealership_id' => 2, // Default dealership ID
+                ];
+                
+                // Create the initial record
+                $callLog = \App\Models\CallLog::create($callData);
+                \Illuminate\Support\Facades\Log::info('Created initial call record', [
+                    'call_log_id' => $callLog->id,
+                    'caller_number' => $phoneNumber,
+                    'recipient_number' => $recipientNumber
+                ]);
+            }
+        }
+        
+        // Check for Vapi end-of-call-report format
+        if ((isset($payload['message']) && isset($payload['message']['type']) && $payload['message']['type'] === 'end-of-call-report') ||
+            (isset($payload['event']) && $payload['event'] === 'end-of-call-report')) {
+            \Illuminate\Support\Facades\Log::info('Processing Vapi end-of-call-report', [
+                'payload_structure' => array_keys($payload),
+                'timestamp' => $payload['message']['timestamp'] ?? null
+            ]);
+            return $this->handleEndOfCallReport($payload);
+        }
+        
+        // Parse the webhook data for standard event format
+        $data = $request->json()->all();
+        $eventType = $data['event'] ?? null;
+        
+        if (!$eventType) {
+            \Illuminate\Support\Facades\Log::warning('Missing event type in webhook payload');
+            return response()->json(['status' => 'success', 'message' => 'No event type found, but request processed'], 200);
+        }
+        
+        \Illuminate\Support\Facades\Log::info('Processing webhook event', ['event' => $eventType]);
+        
+        // Handle different event types
+        switch ($eventType) {
+            case 'call.created':
+                return $this->handleCallCreated($data);
+            case 'call.started':
+                return $this->handleCallStarted($data);
+            case 'call.completed':
+                return $this->handleCallCompleted($data);
+            case 'call.failed':
+                return $this->handleCallFailed($data);
+            default:
+                \Illuminate\Support\Facades\Log::info('Unhandled event type', ['event' => $eventType]);
+                return response()->json(['status' => 'success', 'message' => 'Event received but not processed'], 200);
+        }
+    }
+    
+    /**
+     * Extract call ID from any webhook format.
+     *
+     * @param  array  $payload
+     * @return string|null
+     */
+    protected function extractCallId(array $payload)
+    {
+        // Try different possible locations for call ID
+        if (isset($payload['data']) && isset($payload['data']['id'])) {
+            return $payload['data']['id'];
+        } elseif (isset($payload['call']) && isset($payload['call']['id'])) {
+            return $payload['call']['id'];
+        } elseif (isset($payload['id'])) {
+            return $payload['id'];
+        } elseif (isset($payload['message']) && isset($payload['message']['call']) && isset($payload['message']['call']['id'])) {
+            return $payload['message']['call']['id'];
+        } elseif (isset($payload['message']) && isset($payload['message']['id'])) {
+            return $payload['message']['id'];
+        } elseif (isset($payload['message']) && isset($payload['message']['call_id'])) {
+            return $payload['message']['call_id'];
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Handle call.created event.
+     *
+     * @param  array  $data
+     * @return \Illuminate\Http\Response
+     */
+    protected function handleCallCreated(array $data)
+    {
+        $callData = $data['data'] ?? [];
+        $callId = $callData['id'] ?? null;
+        
+        if (!$callId) {
+            \Illuminate\Support\Facades\Log::warning('Missing call_id in webhook data', ['data' => $data]);
+            return response()->json(['status' => 'error', 'message' => 'Missing call_id'], 400);
+        }
+        
+        try {
+            // Log the incoming data
+            \Illuminate\Support\Facades\Log::info('Processing call.created webhook', [
+                'call_data' => $callData,
+                'dealership_id' => $this->getDealershipIdFromNumber($callData['to'] ?? null)
+            ]);
+            
+            // Check if a call log with this ID already exists
+            $existingLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            if ($existingLog) {
+                // Update existing call log
+                \Illuminate\Support\Facades\Log::info('Updating existing call log', ['call_id' => $callId]);
+                
+                $existingLog->update([
+                    'status' => 'initiated',
+                    'direction' => $callData['direction'] ?? $existingLog->direction,
+                    'caller_number' => $callData['from'] ?? $existingLog->caller_number,
+                    'recipient_number' => $callData['to'] ?? $existingLog->recipient_number,
+                    'assistant_id' => $callData['assistant_id'] ?? $existingLog->assistant_id,
+                    'metadata' => json_encode(array_merge(is_array($existingLog->metadata) ? $existingLog->metadata : [], $callData)),
+                ]);
+                
+                \Illuminate\Support\Facades\Log::info('Call log updated successfully', ['call_log_id' => $existingLog->id]);
+                return response()->json(['status' => 'success', 'call_log_id' => $existingLog->id, 'action' => 'updated'], 200);
+            } else {
+                // Create a new call log
+                $callLog = \App\Models\CallLog::create([
+                    'call_id' => $callId,
+                    'status' => 'initiated',
+                    'direction' => $callData['direction'] ?? 'inbound',
+                    'caller_number' => $callData['from'] ?? null,
+                    'recipient_number' => $callData['to'] ?? null,
+                    'assistant_id' => $callData['assistant_id'] ?? null,
+                    'metadata' => json_encode($callData),
+                    // Dealership ID would need to be determined based on your business logic
+                    'dealership_id' => $this->getDealershipIdFromNumber($callData['to'] ?? null),
+                ]);
+                
+                \Illuminate\Support\Facades\Log::info('Call log created successfully', ['call_log_id' => $callLog->id]);
+                return response()->json(['status' => 'success', 'call_log_id' => $callLog->id, 'action' => 'created'], 200);
+            }
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('Error processing call log: ' . $e->getMessage(), [
+                'exception' => $e,
+                'call_data' => $callData
+            ]);
+            
+            return response()->json(['status' => 'error', 'message' => 'Failed to process call log'], 500);
+        }
+    }
+    
+    /**
+     * Handle call.started event.
+     *
+     * @param  array  $data
+     * @return \Illuminate\Http\Response
+     */
+    protected function handleCallStarted(array $data)
+    {
+        $callData = $data['data'] ?? [];
+        $callId = $callData['id'] ?? null;
+        
+        if ($callId) {
+            $callLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            if ($callLog) {
+                $callLog->update([
+                    'status' => 'in-progress',
+                    'call_started_at' => now(),
+                ]);
+            }
+        }
+        
+        return response()->json(['status' => 'success'], 200);
+    }
+    
+    /**
+     * Handle call.completed event.
+     *
+     * @param  array  $data
+     * @return \Illuminate\Http\Response
+     */
+    protected function handleCallCompleted(array $data)
+    {
+        $callData = $data['data'] ?? [];
+        $callId = $callData['id'] ?? null;
+        
+        if ($callId) {
+            $callLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            if ($callLog) {
+                $callLog->update([
+                    'status' => 'completed',
+                    'call_ended_at' => now(),
+                    'duration' => $callData['duration'] ?? $callLog->duration,
+                    'transcript' => $callData['transcript'] ?? null,
+                    'metadata' => json_encode(array_merge(is_array($callLog->metadata) ? $callLog->metadata : [], $callData)),
+                ]);
+            }
+        }
+        
+        return response()->json(['status' => 'success'], 200);
+    }
+    
+    /**
+     * Handle call.failed event.
+     *
+     * @param  array  $data
+     * @return \Illuminate\Http\Response
+     */
+    protected function handleCallFailed(array $data)
+    {
+        $callData = $data['data'] ?? [];
+        $callId = $callData['id'] ?? null;
+        
+        if ($callId) {
+            $callLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            if ($callLog) {
+                $callLog->update([
+                    'status' => 'failed',
+                    'call_ended_at' => now(),
+                    'metadata' => json_encode(array_merge(is_array($callLog->metadata) ? $callLog->metadata : [], $callData)),
+                ]);
+            }
+        }
+        
+        return response()->json(['status' => 'success'], 200);
+    }
+    
+    /**
+     * Get dealership ID from phone number.
+     *
+     * @param  string|null  $phoneNumber
+     * @return int|null
+     */
+    /**
+     * Handle end-of-call-report event from Vapi.
+     *
+     * @param  array  $data
+     * @return \Illuminate\Http\Response
+     */
+    protected function handleEndOfCallReport(array $data)
+    {
+        // Log the start of processing and data structure
+        \Illuminate\Support\Facades\Log::info('Starting to process end-of-call-report', [
+            'data_keys' => array_keys($data),
+            'timestamp' => date('Y-m-d H:i:s')
+        ]);
+        
+        try {
+            // Log only essential data structure information to avoid memory issues
+            \Illuminate\Support\Facades\Log::info('End-of-call-report data structure', [
+                'data_keys' => array_keys($data),
+                'message_keys' => isset($data['message']) ? array_keys($data['message']) : [],
+                'call_keys' => isset($data['call']) ? array_keys($data['call']) : [],
+                // Don't log the full payload to avoid memory issues
+            ]);
+            
+            // Extract relevant data from the Vapi end-of-call-report format
+            $message = $data['message'] ?? [];
+            $call = $data['call'] ?? [];
+            
+            // Extract call ID
+            $callId = $this->extractCallId($data);
+            if (!$callId) {
+                $callId = 'vapi-' . uniqid();
+                \Illuminate\Support\Facades\Log::warning('No call_id found in payload, generated: ' . $callId);
+            }
+            
+            // Extract customer phone number (caller_number)
+            $phoneNumber = null;
+            if (isset($data['customer']) && isset($data['customer']['number'])) {
+                $phoneNumber = $data['customer']['number'];
+            } elseif (isset($message['customer']) && isset($message['customer']['number'])) {
+                $phoneNumber = $message['customer']['number'];
+            } elseif (isset($call['customer']) && isset($call['customer']['number'])) {
+                $phoneNumber = $call['customer']['number'];
+            } elseif (isset($data['from'])) {
+                $phoneNumber = $data['from'];
+            } elseif (isset($message['from'])) {
+                $phoneNumber = $message['from'];
+            }
+            
+            // Determine call status based on end reason
+            $status = 'completed';
+            if (isset($data['endedReason'])) {
+                if ($data['endedReason'] === 'customer-ended-call') {
+                    $status = 'completed';
+                } elseif (strpos($data['endedReason'], 'error') !== false) {
+                    $status = 'failed';
+                }
+            }
+            
+            // Extract transcript from the appropriate location in the payload
+            $transcript = null;
+            if (isset($message['artifact']) && isset($message['artifact']['transcript'])) {
+                $transcript = $message['artifact']['transcript'];
+            } elseif (isset($data['transcript'])) {
+                $transcript = $data['transcript'];
+            } elseif (isset($message['transcript'])) {
+                $transcript = $message['transcript'];
+            }
+            
+            // Ensure transcript is a string
+            if (is_array($transcript)) {
+                \Illuminate\Support\Facades\Log::info('Converting transcript array to string', ['transcript_type' => gettype($transcript)]);
+                $transcript = json_encode($transcript, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            }
+            
+            // Extract VAPI summary
+            $vapiSummary = null;
+            if (isset($message['artifact']) && isset($message['artifact']['summary'])) {
+                $vapiSummary = $message['artifact']['summary'];
+            } elseif (isset($data['summary'])) {
+                $vapiSummary = $data['summary'];
+            } elseif (isset($message['summary'])) {
+                $vapiSummary = $message['summary'];
+            }
+            
+            // Extract VAPI success evaluation (convert to boolean)
+            $vapiSuccessEvaluation = null;
+            if (isset($message['artifact']) && isset($message['artifact']['success_evaluation'])) {
+                $vapiSuccessEvaluation = $this->convertToBoolean($message['artifact']['success_evaluation']);
+            } elseif (isset($data['success_evaluation'])) {
+                $vapiSuccessEvaluation = $this->convertToBoolean($data['success_evaluation']);
+            } elseif (isset($message['success_evaluation'])) {
+                $vapiSuccessEvaluation = $this->convertToBoolean($message['success_evaluation']);
+            }
+            
+            // Extract VAPI analysis
+            $vapiAnalysis = null;
+            if (isset($message['artifact']) && isset($message['artifact']['analysis'])) {
+                $vapiAnalysis = $message['artifact']['analysis'];
+            } elseif (isset($data['analysis'])) {
+                $vapiAnalysis = $data['analysis'];
+            } elseif (isset($message['analysis'])) {
+                $vapiAnalysis = $message['analysis'];
+            }
+            
+            // Extract department information (sales, service, parts, or other)
+            $department = null;
+            
+            // First check if department is explicitly provided in the data
+            if (isset($data['department'])) {
+                $department = strtolower($data['department']);
+            } elseif (isset($message['department'])) {
+                $department = strtolower($message['department']);
+            } elseif (isset($message['artifact']) && isset($message['artifact']['department'])) {
+                $department = strtolower($message['artifact']['department']);
+            } elseif (isset($data['call_classification'])) {
+                $department = strtolower($data['call_classification']);
+                \Illuminate\Support\Facades\Log::info('Found department in data call_classification', ['department' => $department]);
+            } elseif (isset($message['call_classification'])) {
+                $department = strtolower($message['call_classification']);
+                \Illuminate\Support\Facades\Log::info('Found department in message call_classification', ['department' => $department]);
+            } elseif (isset($message['artifact']) && isset($message['artifact']['call_classification'])) {
+                $department = strtolower($message['artifact']['call_classification']);
+            }
+            
+            // Ensure 'other' is properly handled as a valid department
+            if ($department === 'other') {
+                \Illuminate\Support\Facades\Log::info('Found "other" department, preserving it', ['department' => $department]);
+            }
+            
+            // Check for auto-webhook tool calls that might contain department info
+            if (!$department && isset($message['artifact']) && isset($message['artifact']['messages'])) {
+                foreach ($message['artifact']['messages'] as $artifactMessage) {
+                    if (isset($artifactMessage['toolCalls']) && is_array($artifactMessage['toolCalls'])) {
+                        foreach ($artifactMessage['toolCalls'] as $toolCall) {
+                            if (isset($toolCall['function']) && isset($toolCall['function']['name']) && $toolCall['function']['name'] === 'auto-webhook') {
+                                if (isset($toolCall['function']['arguments'])) {
+                                    $webhookData = json_decode($toolCall['function']['arguments'], true);
+                                    if (isset($webhookData['call_classification'])) {
+                                        $department = strtolower($webhookData['call_classification']);
+                                        \Illuminate\Support\Facades\Log::info('Found department in auto-webhook tool call', ['department' => $department]);
+                                        
+                                        // Ensure 'other' is properly handled in auto-webhook tool calls
+                                        if ($department === 'other') {
+                                            \Illuminate\Support\Facades\Log::info('Found "other" department in auto-webhook, preserving it', ['department' => $department]);
+                                        }
+                                        
+                                        break 2; // Break out of both loops once we find it
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If department is not explicitly provided, try to determine from summary or analysis
+            if (!$department) {
+                // Try to determine from summary
+                $summaryText = '';
+                if (is_string($vapiSummary)) {
+                    $summaryText = $vapiSummary;
+                } elseif (is_array($vapiSummary)) {
+                    $summaryText = implode(' ', $vapiSummary);
+                }
+                
+                // Try to determine from analysis
+                $analysisText = '';
+                if (is_array($vapiAnalysis) && isset($vapiAnalysis['call_purpose'])) {
+                    $analysisText = $vapiAnalysis['call_purpose'];
+                } elseif (is_array($vapiAnalysis) && isset($vapiAnalysis['purpose'])) {
+                    $analysisText = $vapiAnalysis['purpose'];
+                } elseif (is_array($vapiAnalysis) && isset($vapiAnalysis['topic'])) {
+                    $analysisText = $vapiAnalysis['topic'];
+                } elseif (is_string($vapiAnalysis)) {
+                    $analysisText = $vapiAnalysis;
+                }
+                
+                // Combine texts for analysis
+                $combinedText = $summaryText . ' ' . $analysisText;
+                $combinedText = strtolower($combinedText);
+                
+                // Check for keywords related to each department
+                $salesKeywords = ['sales', 'purchase', 'buy', 'buying', 'price', 'cost', 'vehicle', 'car', 'truck', 'suv', 'finance', 'loan', 'trade-in', 'trade in', 'test drive', 'model', 'new car', 'used car'];
+                $serviceKeywords = ['service', 'repair', 'maintenance', 'oil change', 'tire', 'brake', 'appointment', 'booking', 'schedule', 'mechanic', 'fix', 'issue', 'problem', 'check-up', 'inspection'];
+                $partsKeywords = ['part', 'parts', 'accessory', 'accessories', 'component', 'replacement', 'spare', 'order part', 'availability', 'in stock'];
+                
+                $salesMatches = 0;
+                $serviceMatches = 0;
+                $partsMatches = 0;
+                
+                foreach ($salesKeywords as $keyword) {
+                    if (strpos($combinedText, $keyword) !== false) {
+                        $salesMatches++;
+                    }
+                }
+                
+                foreach ($serviceKeywords as $keyword) {
+                    if (strpos($combinedText, $keyword) !== false) {
+                        $serviceMatches++;
+                    }
+                }
+                
+                foreach ($partsKeywords as $keyword) {
+                    if (strpos($combinedText, $keyword) !== false) {
+                        $partsMatches++;
+                    }
+                }
+                
+                // Determine department based on keyword matches
+                if ($salesMatches > $serviceMatches && $salesMatches > $partsMatches) {
+                    $department = 'sales';
+                } elseif ($serviceMatches > $salesMatches && $serviceMatches > $partsMatches) {
+                    $department = 'service';
+                } elseif ($partsMatches > $salesMatches && $partsMatches > $serviceMatches) {
+                    $department = 'parts';
+                } else {
+                    // If no clear department match, set to 'other'
+                    $department = 'other';
+                    \Illuminate\Support\Facades\Log::info('No clear department match, defaulting to "other"', ['sales_matches' => $salesMatches, 'service_matches' => $serviceMatches, 'parts_matches' => $partsMatches]);
+                }
+                
+                // If still no department determined but we have transcript, try analyzing that
+                if (!$department && !empty($transcript)) {
+                    $transcriptText = '';
+                    if (is_string($transcript)) {
+                        $transcriptText = $transcript;
+                    } elseif (is_array($transcript)) {
+                        // Extract text from transcript array
+                        foreach ($transcript as $entry) {
+                            if (isset($entry['text'])) {
+                                $transcriptText .= ' ' . $entry['text'];
+                            }
+                        }
+                    }
+                    
+                    $transcriptText = strtolower($transcriptText);
+                    
+                    // Recheck keywords in transcript
+                    $salesMatches = 0;
+                    $serviceMatches = 0;
+                    $partsMatches = 0;
+                    
+                    foreach ($salesKeywords as $keyword) {
+                        if (strpos($transcriptText, $keyword) !== false) {
+                            $salesMatches++;
+                        }
+                    }
+                    
+                    foreach ($serviceKeywords as $keyword) {
+                        if (strpos($transcriptText, $keyword) !== false) {
+                            $serviceMatches++;
+                        }
+                    }
+                    
+                    foreach ($partsKeywords as $keyword) {
+                        if (strpos($transcriptText, $keyword) !== false) {
+                            $partsMatches++;
+                        }
+                    }
+                    
+                    // Determine department based on keyword matches in transcript
+                    if ($salesMatches > $serviceMatches && $salesMatches > $partsMatches) {
+                        $department = 'sales';
+                    } elseif ($serviceMatches > $salesMatches && $serviceMatches > $partsMatches) {
+                        $department = 'service';
+                    } elseif ($partsMatches > $salesMatches && $partsMatches > $serviceMatches) {
+                        $department = 'parts';
+                    }
+                }
+            }
+            
+            // Log the determined department
+            \Illuminate\Support\Facades\Log::info('Determined call department', ['department' => $department]);
+            
+            // Extract recording URL from the appropriate location in the payload
+            $recordingUrl = null;
+            if (isset($message['artifact']) && isset($message['artifact']['recordingUrl'])) {
+                $recordingUrl = $message['artifact']['recordingUrl'];
+            } elseif (isset($data['recordingUrl'])) {
+                $recordingUrl = $data['recordingUrl'];
+            } elseif (isset($message['recordingUrl'])) {
+                $recordingUrl = $message['recordingUrl'];
+            } elseif (isset($call['recording'])) {
+                $recordingUrl = $call['recording'];
+            }
+            
+            // Initialize stereo recording URL
+            $stereoRecordingUrl = null;
+            if (isset($message['artifact']) && isset($message['artifact']['stereoRecordingUrl'])) {
+                $stereoRecordingUrl = $message['artifact']['stereoRecordingUrl'];
+            } elseif (isset($data['stereoRecordingUrl'])) {
+                $stereoRecordingUrl = $data['stereoRecordingUrl'];
+            } elseif (isset($message['stereoRecordingUrl'])) {
+                $stereoRecordingUrl = $message['stereoRecordingUrl'];
+            }
+            
+            // Initialize cost
+            $cost = null;
+            if (isset($message['artifact']) && isset($message['artifact']['cost'])) {
+                $cost = $message['artifact']['cost'];
+            } elseif (isset($data['cost'])) {
+                $cost = $data['cost'];
+            } elseif (isset($message['cost'])) {
+                $cost = $message['cost'];
+            }
+            
+            // Ensure recording URL is a string
+            if (is_array($recordingUrl)) {
+                \Illuminate\Support\Facades\Log::info('Converting recording URL array to string', ['recording_url_type' => gettype($recordingUrl)]);
+                $recordingUrl = json_encode($recordingUrl, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted recording URL', ['recordingUrl' => $recordingUrl]);
+            
+            // Extract duration from the appropriate location
+            $duration = 0;
+            if (isset($data['durationSeconds'])) {
+                $duration = (int)$data['durationSeconds'];
+            } elseif (isset($data['durationMs'])) {
+                $duration = (int)($data['durationMs'] / 1000);
+            } elseif (isset($message['durationSeconds'])) {
+                $duration = (int)$message['durationSeconds'];
+            }
+            
+            // Extract timestamps
+            $startedAt = null;
+            if (isset($data['startedAt'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($data['startedAt']));
+            } elseif (isset($message['startedAt'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($message['startedAt']));
+            } elseif (isset($call['startedAt'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($call['startedAt']));
+            } elseif (isset($data['timestamp'])) {
+                // If we only have a timestamp, use it for both start and end
+                $startedAt = date('Y-m-d H:i:s', strtotime($data['timestamp']));
+            } elseif (isset($message['timestamp'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($message['timestamp']));
+            }
+            
+            $endedAt = null;
+            if (isset($data['endedAt'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($data['endedAt']));
+            } elseif (isset($message['endedAt'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($message['endedAt']));
+            } elseif (isset($call['endedAt'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($call['endedAt']));
+            } elseif (isset($data['timestamp'])) {
+                // If we only have a timestamp, use it for both start and end
+                $endedAt = date('Y-m-d H:i:s', strtotime($data['timestamp']));
+            } elseif (isset($message['timestamp'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($message['timestamp']));
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted timestamps', [
+                'startedAt' => $startedAt,
+                'endedAt' => $endedAt
+            ]);
+            
+            // Extract recipient phone number (dealership number)
+            $recipientNumber = null;
+            if (isset($data['phoneNumber']) && isset($data['phoneNumber']['number'])) {
+                $recipientNumber = $data['phoneNumber']['number'];
+            } elseif (isset($message['phoneNumber']) && isset($message['phoneNumber']['number'])) {
+                $recipientNumber = $message['phoneNumber']['number'];
+            } elseif (isset($call['phoneNumber']) && isset($call['phoneNumber']['number'])) {
+                $recipientNumber = $call['phoneNumber']['number'];
+            } elseif (isset($data['to'])) {
+                $recipientNumber = $data['to'];
+            } elseif (isset($message['to'])) {
+                $recipientNumber = $message['to'];
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted recipient phone number', ['recipientNumber' => $recipientNumber]);
+            
+            // Extract assistant ID
+            $assistantId = null;
+            if (isset($data['assistant']) && isset($data['assistant']['id'])) {
+                $assistantId = $data['assistant']['id'];
+            } elseif (isset($message['assistant']) && isset($message['assistant']['id'])) {
+                $assistantId = $message['assistant']['id'];
+            } elseif (isset($call['assistant']) && isset($call['assistant']['id'])) {
+                $assistantId = $call['assistant']['id'];
+            } elseif (isset($message['assistant_id'])) {
+                $assistantId = $message['assistant_id'];
+            } elseif (isset($data['assistant_id'])) {
+                $assistantId = $data['assistant_id'];
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted assistant ID', ['assistantId' => $assistantId]);
+            
+            // Check if a call log with this ID already exists
+            $existingLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            // Try to encode metadata safely
+            try {
+                $encodedMetadata = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+                
+                // Check if encoding failed
+                if ($encodedMetadata === false) {
+                    \Illuminate\Support\Facades\Log::warning('JSON encoding failed for metadata', [
+                        'json_error' => json_last_error_msg(),
+                        'data_sample' => array_slice($data, 0, 3) // Log just a sample of the data
+                    ]);
+                    // Use a simpler version of the data
+                    $encodedMetadata = json_encode([
+                        'call_id' => $callId,
+                        'timestamp' => date('Y-m-d H:i:s'),
+                        'error' => 'Original metadata could not be encoded'
+                    ]);
+                }
+            } catch (\Exception $e) {
+                \Illuminate\Support\Facades\Log::warning('Exception during JSON encoding: ' . $e->getMessage());
+                $encodedMetadata = json_encode(['error' => 'Failed to encode metadata']);
+            }
+            
+            $callData = [
+                'call_id' => $callId,
+                'status' => $status,
+                'direction' => 'inbound', // Assuming all calls are inbound for now
+                'caller_number' => $phoneNumber,
+                'recipient_number' => $recipientNumber,
+                'assistant_id' => $assistantId,
+                'transcript' => $transcript,
+                'recording_url' => $recordingUrl,
+                'duration' => $duration,
+                'call_started_at' => $startedAt,
+                'call_ended_at' => $endedAt,
+                'metadata' => $encodedMetadata,
+                'dealership_id' => 2, // Always assign to dealership ID 2
+                'department' => $department, // Add the department field (sales, service, or parts)
+                // New VAPI metadata fields
+                'vapi_summary' => $vapiSummary,
+                'vapi_success_evaluation' => $vapiSuccessEvaluation,
+                'vapi_analysis' => $vapiAnalysis,
+                'vapi_recording_url' => $recordingUrl,
+                'vapi_stereo_recording_url' => $stereoRecordingUrl,
+                'vapi_cost' => $cost,
+                'vapi_duration_seconds' => $duration
+            ];
+            
+            // Log the call data before database operations
+            \Illuminate\Support\Facades\Log::info('Call data prepared for database', [
+                'call_id' => $callId,
+                'has_recording_url' => !empty($recordingUrl),
+                'has_transcript' => !empty($transcript),
+                'metadata_encoded' => !empty($encodedMetadata),
+                'department' => $department,
+                'has_vapi_summary' => !empty($vapiSummary),
+                'has_vapi_analysis' => !empty($vapiAnalysis),
+                'has_vapi_success_evaluation' => !empty($vapiSuccessEvaluation),
+                'has_stereo_recording_url' => !empty($stereoRecordingUrl),
+                'has_cost' => !empty($cost)
+            ]);
+            
+            if ($existingLog) {
+                // Update existing call log
+                \Illuminate\Support\Facades\Log::info('Updating existing call log from end-of-call-report', ['call_id' => $callId]);
+                try {
+                    $existingLog->update($callData);
+                    \Illuminate\Support\Facades\Log::info('Successfully updated call log', ['call_log_id' => $existingLog->id]);
+                } catch (\Exception $e) {
+                    \Illuminate\Support\Facades\Log::error('Failed to update call log: ' . $e->getMessage(), [
+                        'exception' => $e->getMessage(),
+                        'file' => $e->getFile(),
+                        'line' => $e->getLine()
+                    ]);
+                    throw $e; // Re-throw to be caught by outer catch block
+                }
+                return response()->json(['status' => 'success', 'call_log_id' => $existingLog->id, 'action' => 'updated'], 200);
+            } else {
+                // Create new call log
+                \Illuminate\Support\Facades\Log::info('Creating new call log from end-of-call-report', ['call_id' => $callId]);
+                try {
+                    $callLog = \App\Models\CallLog::create($callData);
+                    \Illuminate\Support\Facades\Log::info('Successfully created call log', ['call_log_id' => $callLog->id]);
+                } catch (\Exception $e) {
+                    \Illuminate\Support\Facades\Log::error('Failed to create call log: ' . $e->getMessage(), [
+                        'exception' => $e->getMessage(),
+                        'file' => $e->getFile(),
+                        'line' => $e->getLine()
+                    ]);
+                    throw $e; // Re-throw to be caught by outer catch block
+                }
+                return response()->json(['status' => 'success', 'call_log_id' => $callLog->id, 'action' => 'created'], 200);
+            }
+        } catch (\Exception $e) {
+            // Get detailed error information including stack trace
+            \Illuminate\Support\Facades\Log::error('Error processing end-of-call-report: ' . $e->getMessage(), [
+                'exception' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+                'call_data' => $callData ?? [],
+                'raw_data' => $message
+            ]);
+            
+            return response()->json(['status' => 'error', 'message' => 'Failed to process end-of-call-report: ' . $e->getMessage()], 500);
+        }
+            
+            // Log the determined department
+            \Illuminate\Support\Facades\Log::info('Determined call department', ['department' => $department]);
+            
+            // Extract recording URL from the appropriate location in the payload
+            $recordingUrl = null;
+            if (isset($message['artifact']) && isset($message['artifact']['recordingUrl'])) {
+                $recordingUrl = $message['artifact']['recordingUrl'];
+            } elseif (isset($data['recordingUrl'])) {
+                $recordingUrl = $data['recordingUrl'];
+            } elseif (isset($message['recordingUrl'])) {
+                $recordingUrl = $message['recordingUrl'];
+            } elseif (isset($call['recording'])) {
+                $recordingUrl = $call['recording'];
+            }
+            
+            // Initialize stereo recording URL
+            $stereoRecordingUrl = null;
+            if (isset($message['artifact']) && isset($message['artifact']['stereoRecordingUrl'])) {
+                $stereoRecordingUrl = $message['artifact']['stereoRecordingUrl'];
+            } elseif (isset($data['stereoRecordingUrl'])) {
+                $stereoRecordingUrl = $data['stereoRecordingUrl'];
+            } elseif (isset($message['stereoRecordingUrl'])) {
+                $stereoRecordingUrl = $message['stereoRecordingUrl'];
+            }
+            
+            // Initialize cost
+            $cost = null;
+            if (isset($message['artifact']) && isset($message['artifact']['cost'])) {
+                $cost = $message['artifact']['cost'];
+            } elseif (isset($data['cost'])) {
+                $cost = $data['cost'];
+            } elseif (isset($message['cost'])) {
+                $cost = $message['cost'];
+            }
+            
+            // Ensure recording URL is a string
+            if (is_array($recordingUrl)) {
+                \Illuminate\Support\Facades\Log::info('Converting recording URL array to string', ['recording_url_type' => gettype($recordingUrl)]);
+                $recordingUrl = json_encode($recordingUrl, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted recording URL', ['recordingUrl' => $recordingUrl]);
+            
+            // Extract duration from the appropriate location
+            $duration = 0;
+            if (isset($data['durationSeconds'])) {
+                $duration = (int)$data['durationSeconds'];
+            } elseif (isset($data['durationMs'])) {
+                $duration = (int)($data['durationMs'] / 1000);
+            } elseif (isset($message['durationSeconds'])) {
+                $duration = (int)$message['durationSeconds'];
+            }
+            
+            // Extract timestamps
+            $startedAt = null;
+            if (isset($data['startedAt'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($data['startedAt']));
+            } elseif (isset($message['startedAt'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($message['startedAt']));
+            } elseif (isset($call['startedAt'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($call['startedAt']));
+            } elseif (isset($data['timestamp'])) {
+                // If we only have a timestamp, use it for both start and end
+                $startedAt = date('Y-m-d H:i:s', strtotime($data['timestamp']));
+            } elseif (isset($message['timestamp'])) {
+                $startedAt = date('Y-m-d H:i:s', strtotime($message['timestamp']));
+            }
+            
+            $endedAt = null;
+            if (isset($data['endedAt'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($data['endedAt']));
+            } elseif (isset($message['endedAt'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($message['endedAt']));
+            } elseif (isset($call['endedAt'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($call['endedAt']));
+            } elseif (isset($data['timestamp'])) {
+                // If we only have a timestamp, use it for both start and end
+                $endedAt = date('Y-m-d H:i:s', strtotime($data['timestamp']));
+            } elseif (isset($message['timestamp'])) {
+                $endedAt = date('Y-m-d H:i:s', strtotime($message['timestamp']));
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted timestamps', [
+                'startedAt' => $startedAt,
+                'endedAt' => $endedAt
+            ]);
+            
+            // Extract recipient phone number (dealership number)
+            $recipientNumber = null;
+            if (isset($data['phoneNumber']) && isset($data['phoneNumber']['number'])) {
+                $recipientNumber = $data['phoneNumber']['number'];
+            } elseif (isset($message['phoneNumber']) && isset($message['phoneNumber']['number'])) {
+                $recipientNumber = $message['phoneNumber']['number'];
+            } elseif (isset($call['phoneNumber']) && isset($call['phoneNumber']['number'])) {
+                $recipientNumber = $call['phoneNumber']['number'];
+            } elseif (isset($data['to'])) {
+                $recipientNumber = $data['to'];
+            } elseif (isset($message['to'])) {
+                $recipientNumber = $message['to'];
+            }
+            
+            \Illuminate\Support\Facades\Log::info('Extracted recipient phone number', ['recipientNumber' => $recipientNumber]);
+            
+            // Extract assistant ID
+            $assistantId = null;
+            if (isset($data['assistant']) && isset($data['assistant']['id'])) {
+                $assistantId = $data['assistant']['id'];
+            } elseif (isset($message['assistant']) && isset($message['assistant']['id'])) {
+                $assistantId = $message['assistant']['id'];
+            } elseif (isset($call['assistant']) && isset($call['assistant']['id'])) {
+                $assistantId = $call['assistant']['id'];
+            } elseif (isset($message['assistant_id'])) {
+                $assistantId = $message['assistant_id'];
+            } elseif (isset($data['assistant_id'])) {
+                $assistantId = $data['assistant_id'];
+            }
+
+            \Illuminate\Support\Facades\Log::info('Extracted assistant ID', ['assistantId' => $assistantId]);
+            
+            // Check if a call log with this ID already exists
+            $existingLog = \App\Models\CallLog::where('call_id', $callId)->first();
+            
+            // Try to encode metadata safely
+            try {
+                $encodedMetadata = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+                
+                // Check if encoding failed
+                if ($encodedMetadata === false) {
+                    \Illuminate\Support\Facades\Log::warning('JSON encoding failed for metadata', [
+                        'json_error' => json_last_error_msg(),
+                        'data_sample' => array_slice($data, 0, 3) // Log just a sample of the data
+                    ]);
+                    // Use a simpler version of the data
+                    $encodedMetadata = json_encode([
+                        'call_id' => $callId,
+                        'timestamp' => date('Y-m-d H:i:s'),
+                        'error' => 'Original metadata could not be encoded'
+                    ]);
+                }
+            } catch (\Exception $e) {
+                \Illuminate\Support\Facades\Log::warning('Exception during JSON encoding: ' . $e->getMessage());
+                $encodedMetadata = json_encode(['error' => 'Failed to encode metadata']);
+            }
+            
+            $callData = [
+                'call_id' => $callId,
+                'status' => $status,
+                'direction' => 'inbound', // Assuming all calls are inbound for now
+                'caller_number' => $phoneNumber,
+                'recipient_number' => $recipientNumber,
+                'assistant_id' => $assistantId,
+                'transcript' => $transcript,
+                'recording_url' => $recordingUrl,
+                'duration' => $duration,
+                'call_started_at' => $startedAt,
+                'call_ended_at' => $endedAt,
+                'metadata' => $encodedMetadata,
+                'dealership_id' => 2, // Always assign to dealership ID 2
+                'department' => $department, // Add the department field (sales, service, or parts)
+                // New VAPI metadata fields
+                'vapi_summary' => $vapiSummary,
+                'vapi_success_evaluation' => $vapiSuccessEvaluation,
+                'vapi_analysis' => $vapiAnalysis,
+                'vapi_recording_url' => $recordingUrl,
+                'vapi_stereo_recording_url' => $stereoRecordingUrl,
+                'vapi_cost' => $cost,
+                'vapi_duration_seconds' => $duration
+            ];
+            
+            // Log the call data before database operations
+            \Illuminate\Support\Facades\Log::info('Call data prepared for database', [
+                'call_id' => $callId,
+                'has_recording_url' => !empty($recordingUrl),
+                'has_transcript' => !empty($transcript),
+                'metadata_encoded' => !empty($encodedMetadata),
+                'department' => $department,
+                'has_vapi_summary' => !empty($vapiSummary),
+                'has_vapi_analysis' => !empty($vapiAnalysis),
+                'has_vapi_success_evaluation' => !empty($vapiSuccessEvaluation),
+                'has_stereo_recording_url' => !empty($stereoRecordingUrl),
+                'has_cost' => !empty($cost)
+            ]);
+            
+            if ($existingLog) {
+                // Update existing call log
+                \Illuminate\Support\Facades\Log::info('Updating existing call log from end-of-call-report', ['call_id' => $callId]);
+                try {
+                    $existingLog->update($callData);
+                    \Illuminate\Support\Facades\Log::info('Successfully updated call log', ['call_log_id' => $existingLog->id]);
+                } catch (\Exception $e) {
+                    \Illuminate\Support\Facades\Log::error('Failed to update call log: ' . $e->getMessage(), [
+                        'exception' => $e->getMessage(),
+                        'file' => $e->getFile(),
+                        'line' => $e->getLine()
+                    ]);
+                    throw $e; // Re-throw to be caught by outer catch block
+                }
+                return response()->json(['status' => 'success', 'call_log_id' => $existingLog->id, 'action' => 'updated'], 200);
+            } else {
+                // Create new call log
+                \Illuminate\Support\Facades\Log::info('Creating new call log from end-of-call-report', ['call_id' => $callId]);
+                try {
+                    $callLog = \App\Models\CallLog::create($callData);
+                    \Illuminate\Support\Facades\Log::info('Successfully created call log', ['call_log_id' => $callLog->id]);
+                } catch (\Exception $e) {
+                    \Illuminate\Support\Facades\Log::error('Failed to create call log: ' . $e->getMessage(), [
+                        'exception' => $e->getMessage(),
+                        'file' => $e->getFile(),
+                        'line' => $e->getLine()
+                    ]);
+                    throw $e; // Re-throw to be caught by outer catch block
+                }
+                return response()->json(['status' => 'success', 'call_log_id' => $callLog->id, 'action' => 'created'], 200);
+            }
+    }
+    
+    /**
+     * Convert various input formats to a boolean value
+     *
+     * @param mixed $value The value to convert to boolean
+     * @return bool|null Boolean value or null if conversion not possible
+     */
+    protected function convertToBoolean($value)
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        
+        if (is_string($value)) {
+            $lowerValue = strtolower($value);
+            if ($lowerValue === 'true' || $lowerValue === 'yes' || $lowerValue === '1') {
+                return true;
+            }
+            if ($lowerValue === 'false' || $lowerValue === 'no' || $lowerValue === '0') {
+                return false;
+            }
+        }
+        
+        if (is_numeric($value)) {
+            return (bool)$value;
+        }
+        
+        if (is_array($value) || is_object($value)) {
+            // If it's an array or object with a 'success' key/property
+            if (is_array($value) && isset($value['success'])) {
+                return $this->convertToBoolean($value['success']);
+            }
+            
+            // If it's an object with a success property
+            if (is_object($value) && isset($value->success)) {
+                return $this->convertToBoolean($value->success);
+            }
+            
+            // If it's JSON string
+            if (is_string($value)) {
+                try {
+                    $decoded = json_decode($value, true);
+                    if (json_last_error() === JSON_ERROR_NONE && isset($decoded['success'])) {
+                        return $this->convertToBoolean($decoded['success']);
+                    }
+                } catch (\Exception $e) {
+                    // Ignore JSON parsing errors
+                }
+            }
+            
+            // Non-empty arrays/objects generally evaluate to true
+            return !empty($value);
+        }
+        
+        // If we can't determine a boolean value, return null
+        return null;
+    }
+    
+    protected function getDealershipIdFromNumber($phoneNumber)
+    {
+        // Log the phone number we're trying to match
+        \Illuminate\Support\Facades\Log::info('Looking up dealership ID for phone number', ['phoneNumber' => $phoneNumber]);
+        
+        // If no phone number provided, try to get the first dealership
+        if (!$phoneNumber) {
+            $dealership = \App\Models\Dealership::first();
+            $dealershipId = $dealership ? $dealership->id : null;
+            \Illuminate\Support\Facades\Log::info('No phone number provided, using first dealership', ['dealership_id' => $dealershipId]);
+            return $dealershipId;
+        }
+        
+        // Clean up the phone number for comparison (remove spaces, dashes, etc.)
+        $cleanNumber = preg_replace('/[^0-9]/', '', $phoneNumber);
+        
+        // Try to find a dealership with this phone number
+        // This is a simplified implementation - in a real app, you might have a separate
+        // table for phone lines or a more complex matching logic
+        
+        // For now, we'll just return the first dealership as a fallback
+        $dealership = \App\Models\Dealership::first();
+        $dealershipId = $dealership ? $dealership->id : null;
+        
+        \Illuminate\Support\Facades\Log::info('Found dealership for phone number', [
+            'phone_number' => $phoneNumber, 
+            'dealership_id' => $dealershipId
+        ]);
+        
+        return $dealershipId;
+    }
+}
